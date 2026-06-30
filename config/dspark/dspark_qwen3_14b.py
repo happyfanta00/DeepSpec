@@ -6,7 +6,7 @@ from deepspec.trainer import Qwen3DSparkTrainer
 BASE_TB_DIR = os.path.expanduser("~/tensorboard")
 BASE_CKPT_DIR = os.path.expanduser("~/checkpoints")
 project_name = "deepspec"
-exp_name = "dspark_block8_qwen3_14b"
+exp_name = "dspark_block7_qwen3_14b"
 seed = 42
 
 model = dict(

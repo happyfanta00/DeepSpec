@@ -48,7 +48,7 @@ bash scripts/eval/eval.sh
 `eval.sh` runs `eval.py` against a trained draft checkpoint over the speculative-decoding benchmarks in [eval_datasets/](./eval_datasets/) (gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2). Set:
 
 - `target_name_or_path` — the target model the draft was trained against (e.g. `Qwen/Qwen3-4B`),
-- `draft_name_or_path` — the draft checkpoint, e.g. `~/checkpoints/deepspec/dspark_block8_qwen3_4b/step_latest`, or one of the Hugging Face repo IDs listed in [Released Checkpoints](#released-checkpoints).
+- `draft_name_or_path` — the draft checkpoint, e.g. `~/checkpoints/deepspec/dspark_block7_qwen3_4b/step_latest`, or one of the Hugging Face repo IDs listed in [Released Checkpoints](#released-checkpoints).
 
 ### Released Checkpoints
 

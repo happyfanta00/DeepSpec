@@ -6,7 +6,7 @@ from deepspec.trainer import Gemma4DSparkTrainer
 BASE_TB_DIR = os.path.expanduser("~/tensorboard")
 BASE_CKPT_DIR = os.path.expanduser("~/checkpoints")
 project_name = "deepspec"
-exp_name = "dflash_block8_gemma4_12b"
+exp_name = "dflash_block7_gemma4_12b"
 seed = 42
 
 model = dict(
