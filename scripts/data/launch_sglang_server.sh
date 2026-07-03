@@ -44,6 +44,7 @@ get_host_ip() {
     printf '%s\n' "${host_ip}"
 }
 
+export FLASHINFER_USE_CUDA_NORM=1
 mkdir -p "${log_dir}"
 
 host_ip=$(get_host_ip)

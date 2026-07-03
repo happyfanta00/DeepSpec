@@ -27,7 +27,7 @@ export WORLD_SIZE=${WORLD_SIZE:-1}
 #   config/eagle3/eagle3_qwen3_8b.py
 #   config/eagle3/eagle3_qwen3_14b.py
 
-target_cache_dir=${target_cache_dir:-${HOME}/.cache/deepspec/qwen3_4b_target_cache}
+target_cache_dir=${target_cache_dir:-/mnt/scratch/qwen3_4b_target_cache}
 
 # --opts overrides any config field by dotted key path: --opts "<key.path>=<value>".
 # Values are parsed as Python scalars (int/float/bool/str). Repeat the flag to set
@@ -42,4 +42,5 @@ target_cache_dir=${target_cache_dir:-${HOME}/.cache/deepspec/qwen3_4b_target_cac
 #   --opts "train.local_batch_size=4"
 python train.py \
     --config config/dspark/dspark_qwen3_4b.py \
-    --opts "data.target_cache_path=${target_cache_dir}"
+    --opts "data.target_cache_path=${target_cache_dir}" \
+    --opts "train.local_batch_size=1"
