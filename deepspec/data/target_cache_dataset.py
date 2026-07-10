@@ -707,6 +707,43 @@ class CacheDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_samples
 
+    def _open_sample(self, index: int):
+        """Resolve a sample's record + shard mmap + per-tensor byte sizes (shared read prologue)."""
+        if not (0 <= int(index) < self.num_samples):
+            raise IndexError(index)
+        record = self._read_record(int(index))
+        seq_len = int(record["seq_len"])
+        assert seq_len > 0, f"seq_len must be positive, got {seq_len}"
+        shard_mmap = self._get_shard_mmap(int(record["shard_id"]))
+        nbytes = expected_target_cache_tensor_nbytes(
+            seq_len=seq_len,
+            hidden_size=self.hidden_size,
+            num_target_layers=self.num_target_layers,
+            hidden_dtype=self.hidden_dtype,
+        )
+        return record, seq_len, shard_mmap, nbytes
+
+    def _read_tokens(self, record, seq_len, shard_mmap, nbytes):
+        """Read input_ids + loss_mask (the two small 1-D fields) from a resolved sample."""
+        input_ids = self._read_tensor_from_shard(
+            shard_mmap=shard_mmap, offset=record["input_ids_offset"], shape=(seq_len,),
+            np_dtype=np.int32, torch_dtype=torch.int32, nbytes=nbytes["input_ids"])
+        loss_mask = self._read_tensor_from_shard(
+            shard_mmap=shard_mmap, offset=record["loss_mask_offset"], shape=(seq_len,),
+            np_dtype=np.uint8, torch_dtype=torch.uint8, nbytes=nbytes["loss_mask"])
+        return {"input_ids": input_ids, "loss_mask": loss_mask}
+
+    def read_tokens_only(self, index: int):
+        """Read ONLY input_ids + loss_mask for a sample (no target_hidden_states).
+
+        For OPD optimization #5 (worker recomputes hidden via the teacher): we need just the
+        tokens, not the ~MBs of cached hidden. Because the shard is mmap'd, touching only the
+        input_ids/loss_mask offsets faults in ~KB of pages — it does NOT read the (cold, large)
+        hidden region, so it avoids the sequential-scan cold-read cost of __getitem__.
+        """
+        record, seq_len, shard_mmap, nbytes = self._open_sample(index)
+        return self._read_tokens(record, seq_len, shard_mmap, nbytes)
+
     def close(self):
         for shard_mmap in getattr(self, "shard_mmaps", {}).values():
             shard_mmap.close()
@@ -865,34 +902,9 @@ class CacheDataset(torch.utils.data.Dataset):
         )
 
     def __getitem__(self, index: int):
-        if not (0 <= int(index) < self.num_samples):
-            raise IndexError(index)
-        record = self._read_record(int(index))
-        seq_len = int(record["seq_len"])
-        assert seq_len > 0, f"seq_len must be positive, got {seq_len}"
-        shard_mmap = self._get_shard_mmap(int(record["shard_id"]))
-        nbytes = expected_target_cache_tensor_nbytes(
-            seq_len=seq_len,
-            hidden_size=self.hidden_size,
-            num_target_layers=self.num_target_layers,
-            hidden_dtype=self.hidden_dtype,
-        )
-        input_ids = self._read_tensor_from_shard(
-            shard_mmap=shard_mmap,
-            offset=record["input_ids_offset"],
-            shape=(seq_len,),
-            np_dtype=np.int32,
-            torch_dtype=torch.int32,
-            nbytes=nbytes["input_ids"],
-        )
-        loss_mask = self._read_tensor_from_shard(
-            shard_mmap=shard_mmap,
-            offset=record["loss_mask_offset"],
-            shape=(seq_len,),
-            np_dtype=np.uint8,
-            torch_dtype=torch.uint8,
-            nbytes=nbytes["loss_mask"],
-        )
+        record, seq_len, shard_mmap, nbytes = self._open_sample(index)
+        tokens = self._read_tokens(record, seq_len, shard_mmap, nbytes)
+        input_ids, loss_mask = tokens["input_ids"], tokens["loss_mask"]
         if self.hidden_dtype == "bfloat16":
             target_hidden_states = self._read_bfloat16_tensor_from_shard(
                 shard_mmap=shard_mmap,

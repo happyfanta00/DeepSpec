@@ -391,16 +391,36 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        block_prev_tokens: Optional[torch.Tensor] = None,
     ) -> DSparkForwardOutput:
+        """Block-parallel draft forward.
+
+        SFT path (default): anchors are sampled internally and the markov head is
+        teacher-forced on the REAL next tokens.
+
+        OPD path (on-policy distillation): pass fixed `anchor_positions` (+ `block_keep_mask`)
+        from rollout and `block_prev_tokens` = [anchor_tok, ỹ_1..ỹ_{blk-1}] (the SAMPLED draft
+        tokens) so the markov-corrected `draft_logits` reproduce rollout's `corrected_logits`
+        WITH gradient. Going through this forward (not submethods) is REQUIRED so FSDP's
+        pre-forward hook registers the cross-rank gradient-reduction hooks (see
+        docs/DSpark-OPD.md §S4). Both new args default to None → SFT path unchanged.
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = sample_anchor_positions(
-            seq_len=seq_len,
-            loss_mask=loss_mask,
-            num_anchors=self.num_anchors,
-            device=device,
-        )
+        if anchor_positions is None:
+            anchor_positions, block_keep_mask = sample_anchor_positions(
+                seq_len=seq_len,
+                loss_mask=loss_mask,
+                num_anchors=self.num_anchors,
+                device=device,
+            )
+        else:
+            assert block_keep_mask is not None, (
+                "block_keep_mask must be passed together with anchor_positions (OPD path)."
+            )
         noise_embedding = create_noise_embed(
             self.embed_tokens,
             input_ids,
@@ -470,15 +490,20 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
         )
-        anchor_token_ids = torch.gather(
-            input_ids,
-            1,
-            anchor_positions,
-        )
-        prev_token_ids = torch.cat(
-            [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
-            dim=-1,
-        )
+        if block_prev_tokens is not None:
+            # OPD: markov teacher-forced on the SAMPLED draft tokens (prev = [anchor, ỹ_{<blk}]).
+            prev_token_ids = block_prev_tokens
+        else:
+            # SFT: markov teacher-forced on the REAL next tokens.
+            anchor_token_ids = torch.gather(
+                input_ids,
+                1,
+                anchor_positions,
+            )
+            prev_token_ids = torch.cat(
+                [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
+                dim=-1,
+            )
         draft_logits = self.compute_logits(output_hidden).reshape(
             bsz,
             num_blocks,
