@@ -9,3 +9,10 @@ logs/
 build/
 dist/
 .DS_Store
+
+# Model checkpoints / training artifacts — never commit (can be hundreds of GB)
+**/checkpoints/
+*.pt
+*.safetensors
+**/outputs/
+**/wandb/

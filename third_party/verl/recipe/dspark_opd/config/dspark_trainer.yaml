@@ -1,0 +1,106 @@
+# DSpark-OPD recipe config (overlay on verl's ppo_trainer.yaml).
+# S1: real target-cache dataset; single-GPU; reaches the `data` gate with real samples.
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ---------------- data ----------------
+data:
+  # our dataset reads the target cache directly; train_files/val_files are unused but
+  # must be valid strings for verl's create_rl_dataset signature.
+  train_files: /tmp/dspark_opd_dummy.parquet
+  val_files: /tmp/dspark_opd_dummy.parquet
+  train_batch_size: 2
+  max_prompt_length: 4096
+  max_response_length: 64
+  shuffle: false
+  # Parallel data loading: each sample reads target_hidden_states (~6MB, fp8->bf16 sanitize) from
+  # the cache; with num_workers=0 the main process loads serially and the GPU idles waiting (a
+  # major cause of the low-util / idle windows in multi-step training). 8 workers prefetch in
+  # parallel. Trade-off: a benign "DataLoader worker killed" traceback appears at fit() teardown
+  # (rc still 0, checkpoint intact) — worth it for throughput. persistent_workers avoids per-epoch
+  # respawn cost.
+  dataloader_num_workers: 8
+  # inject our dataset via verl's create_rl_dataset custom_cls seam
+  custom_cls:
+    path: recipe/dspark_opd/dataset.py
+    name: DSparkCacheDataset
+  # DSpark dataset params (S1: real target cache)
+  dspark:
+    target_cache_path: /mnt/scratch/qwen3_4b_target_cache
+    n_samples: 20000      # S6 training cap (cache has ~1.34M); <=0 -> full dataset.
+                          # Must be >= train_batch_size or the dataloader is empty (batch can't
+                          # be formed). gated S0-S5 tests only read the first batch, unaffected.
+
+# ---------------- algorithm ----------------
+algorithm:
+  adv_estimator: token_reward_direct
+  use_kl_in_reward: false
+
+# ---------------- actor / rollout / ref ----------------
+actor_rollout_ref:
+  model:
+    path: /mnt/scratch/checkpoints/deepspec/dspark_block7_qwen3_4b/step_latest  # draft weights
+    override_config:             # open dict on HFModelConfig; carries our custom keys
+                                 # (RolloutConfig is a typed dataclass that rejects unknown keys)
+      # draft ckpt has NO tokenizer files -> tokenizer from TARGET (draft shares vocab, §2.2)
+      dspark_tokenizer_path: Qwen/Qwen3-4B
+      # teacher (target) for the FUSED train_step's in-worker scoring (built by _build_teacher)
+      dspark_teacher_path: Qwen/Qwen3-4B
+      # opt #4: worker-side cache read — worker re-reads target_hidden_states from this dir by the
+      # dispatched sample_index (must match data.dspark.target_cache_path). See init_model._cache.
+      dspark_target_cache_path: /mnt/scratch/qwen3_4b_target_cache
+      # OPD uses far fewer anchors than SFT (512) because teacher must be co-resident (§2.3)
+      dspark_num_anchors: 32     # A: anchors per sample
+      # top-k dense OPD (tensor-contract K); rollout count n is verl rollout.n (batch dim)
+      log_prob_top_k: 16         # K: top-k dense OPD candidates (only_stu); 0 -> single-sample
+      reward_weight_mode: student_p
+      # S4 loss knobs (match SFT config/dspark/dspark_qwen3_4b.py)
+      loss_decay_gamma: 4.0      # block-internal exp(-pos/γ) decay weight
+      confidence_head_alpha: 1.0  # confidence BCE weight in total loss
+  actor:
+    strategy: fsdp
+    use_kl_loss: false
+    ppo_mini_batch_size: 8          # prompt units; verl normalizes ×rollout.n÷dp -> per-GPU mini
+    ppo_micro_batch_size_per_gpu: 1  # per-GPU micro; update_dspark_opd splits+accumulates (§S4)
+    fsdp_config:
+      # actor uses ShardingStrategy.NO_SHARD (set in worker._build_model_optimizer): per-card
+      # full params + cross-rank grad all-reduce. fsdp_size=-1 -> self.device_mesh is 1D (size
+      # == world) so verl's ppo_mini_batch_size //= device_mesh.size() normalization is correct.
+      # (Do NOT use fsdp_size=1: its degenerate HYBRID mesh doesn't all-reduce grads; see §2.6.5.)
+      fsdp_size: -1
+      use_orig_params: true        # required: frozen embed/lm_head
+      forward_prefetch: false
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: bf16
+  rollout:
+    name: dspark                 # -> ("dspark","sync") registered in recipe __init__
+    mode: sync
+    n: 4                         # rollout count (RL semantics): repeat each sample n times in batch
+    tensor_model_parallel_size: 1  # our rollout is single-device PyTorch (no TP)
+
+# ---------------- reward model (teacher) ----------------
+# FUSED design: teacher is built INSIDE the actor worker (_build_teacher) and scored inside
+# train_step — NOT a separate RewardModel worker/role. So enable=false (task_runner skips
+# reward-worker registration; RayPPOTrainer's use_rm becomes false automatically). Teacher path
+# comes from actor_rollout_ref.model.override_config.dspark_teacher_path (below).
+reward_model:
+  enable: false
+
+# ---------------- trainer ----------------
+trainer:
+  n_gpus_per_node: 1
+  nnodes: 1
+  total_epochs: 100            # loop the small cache dataset until total_training_steps reached
+  total_training_steps: 1      # S5 single full step; S6 raises this (e.g. 200)
+  save_freq: 1                 # S5: checkpoint after the single step (S6: e.g. 100). -1=never
+  val_before_train: false
+  logger: [console]
+  project_name: dspark_opd
+  experiment_name: dspark_opd    # override per-run via run.sh EXP=...
