@@ -29,16 +29,38 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 _REPEAT_ON_DRIVER = os.environ.get("DSPARK_REPEAT_ON_DRIVER", "0") == "1"
 
 
+def _fmt_eta(seconds: float) -> str:
+    """Human-readable duration, e.g. 45s / 12m34s / 3h07m."""
+    s = int(max(0.0, seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
 class DSparkTrainer(RayPPOTrainer):
     """RayPPOTrainer with a self-contained OPD multi-step loop (fused train_step; never super().fit())."""
 
     def fit(self):
         rollout_n = int(self.config.actor_rollout_ref.rollout.get("n", 1))
-        total_steps = int(self.config.trainer.get("total_training_steps", 1) or 1)
+        # Standard verl semantics: epochs are the primary control. The parent's _create_dataloader
+        # already set self.total_training_steps = len(train_dataloader) * total_epochs when config
+        # trainer.total_training_steps is null (i.e. "train exactly total_epochs epochs"), or to the
+        # explicit value when set (steps override; may stop mid-epoch). We reuse that computed value.
+        total_epochs = int(self.config.trainer.get("total_epochs", 1))
+        steps_per_epoch = len(self.train_dataloader)
+        total_steps = int(getattr(self, "total_training_steps", 0)
+                          or steps_per_epoch * total_epochs)
         save_freq = int(self.config.trainer.get("save_freq", -1))
         self.global_steps = 0
-        print(f"[DSparkTrainer] fit: total_training_steps={total_steps} rollout.n={rollout_n} "
-              f"save_freq={save_freq}")
+        print(f"[DSparkTrainer] fit: total_epochs={total_epochs} steps_per_epoch={steps_per_epoch} "
+              f"-> total_training_steps={total_steps} rollout.n={rollout_n} save_freq={save_freq}")
+        # Rolling step-time average for throughput / ETA. Skip step 1 (it eats compile + FSDP
+        # lazy-init warmup and would bias the estimate) — accumulate from step 2 onward.
+        _timed_sum, _timed_n = 0.0, 0
         done = False
         for _epoch in range(self.config.trainer.total_epochs):
             if done:
@@ -56,8 +78,16 @@ class DSparkTrainer(RayPPOTrainer):
                     "actor/loss", "actor/pg_loss", "actor/confidence_loss",
                     "actor/grad_norm", "actor/ppo_kl", "actor/n_micro") if k in lg}
                 _mode = "driver-repeat" if _REPEAT_ON_DRIVER else "worker-repeat"
+                # throughput + ETA (avg over timed steps; falls back to this step's time on step 1)
+                if self.global_steps > 1:
+                    _timed_sum += _step_s
+                    _timed_n += 1
+                _avg = (_timed_sum / _timed_n) if _timed_n else _step_s
+                _rate = (1.0 / _avg) if _avg > 0 else 0.0
+                _eta = _avg * max(0, total_steps - self.global_steps)
                 print(f"[DSparkTrainer] step {self.global_steps}/{total_steps} "
-                      f"wall={_step_s:.2f}s [{_mode}] "
+                      f"wall={_step_s:.2f}s avg={_avg:.2f}s ({_rate:.3f} steps/s) "
+                      f"ETA {_fmt_eta(_eta)} [{_mode}] "
                       + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()), flush=True)
                 if save_freq > 0 and self.global_steps % save_freq == 0:
                     self._save_checkpoint()
@@ -66,7 +96,8 @@ class DSparkTrainer(RayPPOTrainer):
                     break
         if save_freq > 0 and self.global_steps % save_freq != 0:
             self._save_checkpoint()   # final save
-        print(f"[DSparkTrainer] fit done at step {self.global_steps}.")
+        print(f"[DSparkTrainer] fit done at step {self.global_steps} "
+              f"(avg {_avg:.2f}s/step, ~{_fmt_eta(_avg * self.global_steps)} total).")
 
     def _prepare_batch(self, batch_dict, repeat_n=1):
         """dict -> DataProto (+ uid). NO rollout.n repeat here — deferred to the worker.

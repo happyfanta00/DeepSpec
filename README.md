@@ -38,6 +38,60 @@ bash scripts/train/train.sh
 
 Hardware: the default configs and scripts assume a single node with 8 GPUs. For fewer GPUs, reduce `CUDA_VISIBLE_DEVICES`.
 
+### On-Policy Distillation (DSpark-OPD)
+
+`train.sh` above trains the DSpark draft with offline SFT against the cached target outputs. **DSpark-OPD** is an optional *on-policy* fine-tuning stage that runs on top of an SFT-trained draft: the draft rolls out its own block predictions, the target model scores them token-by-token (KL), and the draft is updated with a policy-gradient + confidence loss. This mainly reduces exposure bias in the markov/confidence heads. It is built as a [verl](https://github.com/volcengine/verl) 0.7.0 recipe under [third_party/verl/recipe/dspark_opd/](./third_party/verl/recipe/dspark_opd/).
+
+**Prerequisites**
+
+1. A target cache (from [Data Preparation](#data-preparation)), same as SFT.
+2. An SFT-trained DSpark draft checkpoint to start from (the output of `train.sh`).
+3. The verl environment (separate from the SFT env); see [docs/opd/env-setup.md](./docs/opd/env-setup.md).
+
+Point the config at your paths in [third_party/verl/recipe/dspark_opd/config/dspark_trainer.yaml](./third_party/verl/recipe/dspark_opd/config/dspark_trainer.yaml):
+
+- `actor_rollout_ref.model.path` — the SFT draft checkpoint to fine-tune,
+- `data.dspark.target_cache_path` / `override_config.dspark_target_cache_path` — the target cache dir,
+- `override_config.dspark_teacher_path` — the target model (e.g. `Qwen/Qwen3-4B`).
+
+**Train**
+
+```bash
+# single GPU, 1 epoch (default)
+bash third_party/verl/recipe/dspark_opd/run.sh
+
+# 8-GPU, 1 epoch
+NGPUS=8 BATCH=64 EXP=run1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash third_party/verl/recipe/dspark_opd/run.sh
+```
+
+Training length follows standard verl semantics — **epochs are the primary control** (`EPOCHS`, default `1` = one full pass over the dataset; `total_training_steps` is derived as `len(dataloader) × EPOCHS`). To cap at a fixed step count instead (e.g. a short smoke run), set `STEPS` — it overrides epochs and may stop mid-epoch:
+
+```bash
+NGPUS=2 BATCH=16 STEPS=3 EXP=smoke CUDA_VISIBLE_DEVICES=0,1 \
+  bash third_party/verl/recipe/dspark_opd/run.sh
+```
+
+`run.sh` knobs: `NGPUS`, `BATCH` (`data.train_batch_size`, must be divisible by GPU count), `EPOCHS`, `STEPS` (optional cap), `SAVE_FREQ`, `EXP`. Dataset size is `data.dspark.n_samples` in the config (`-1` = the full cache, ~1.34M samples — so 1 epoch is long; lower it for a shorter pass). Checkpoints are written to `third_party/verl/checkpoints/dspark_opd/<EXP>/global_step_<N>/`.
+
+The default data path is `DSPARK_HIDDEN_MODE=recompute`: the driver dispatches only tokens and each worker recomputes `target_hidden_states` from the co-resident teacher (fastest, and matches the hidden states used at inference). Set `DSPARK_HIDDEN_MODE=cache` (worker reads cached hidden) or `dispatch` (driver ships cached hidden) to switch data paths. See [docs/opd/worker-side-cache-read-design.md](./docs/opd/worker-side-cache-read-design.md).
+
+**Convert + evaluate**
+
+The verl checkpoint is FSDP-sharded; convert it to the HF format `eval.sh` expects, then evaluate as usual:
+
+```bash
+# 1) convert verl checkpoint -> HF-style draft checkpoint
+PYTHONPATH=$(pwd) python scripts/opd/convert_ckpt.py \
+    --verl-ckpt third_party/verl/checkpoints/dspark_opd/run1/global_step_200 \
+    --out /path/to/dspark_opd_qwen3_4b/step_200
+
+# 2) evaluate (see the Evaluation section) with draft_name_or_path=/path/to/dspark_opd_qwen3_4b/step_200
+bash scripts/eval/eval.sh
+```
+
+Design docs: [docs/DSpark-OPD.md](./docs/DSpark-OPD.md) (master plan) and [docs/opd/](./docs/opd/) (fused-step, data-flow optimizations, tensor contract, env setup).
+
 
 ## Evaluation
 
