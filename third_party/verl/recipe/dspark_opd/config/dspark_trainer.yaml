@@ -32,7 +32,7 @@ data:
   # DSpark dataset params (S1: real target cache)
   dspark:
     target_cache_path: /mnt/scratch/qwen3_4b_target_cache
-    n_samples: 20000      # S6 training cap (cache has ~1.34M); <=0 -> full dataset.
+    n_samples: -1      # S6 training cap (cache has ~1.34M); <=0 -> full dataset.
                           # Must be >= train_batch_size or the dataloader is empty (batch can't
                           # be formed). gated S0-S5 tests only read the first batch, unaffected.
 
@@ -97,9 +97,12 @@ reward_model:
 trainer:
   n_gpus_per_node: 1
   nnodes: 1
-  total_epochs: 100            # loop the small cache dataset until total_training_steps reached
-  total_training_steps: 1      # S5 single full step; S6 raises this (e.g. 200)
-  save_freq: 1                 # S5: checkpoint after the single step (S6: e.g. 100). -1=never
+  # Standard verl control: epochs primary. Default 1 epoch = one full pass over the dataset
+  # (total_training_steps=null -> derived as len(train_dataloader) * total_epochs). Set
+  # total_training_steps to an int to cap at a fixed step count instead (may stop mid-epoch).
+  total_epochs: 1
+  total_training_steps: null
+  save_freq: 100               # checkpoint every N steps (-1=never; final step always saved)
   val_before_train: false
   logger: [console]
   project_name: dspark_opd
