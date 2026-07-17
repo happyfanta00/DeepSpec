@@ -28,8 +28,10 @@ SGLANG_VENV="$HOME/.venv/dspark-opd-sglang"       # 目标 env（用户已重建
 PY="$SGLANG_VENV/bin/python"
 DEEPSPEC_DIR="/home/ec2-user/efs_data/workspace/DeepSpec"
 VERL_DIR="${DEEPSPEC_DIR}/third_party/verl"
-# upstream clone（Claude 已 clone 的最新 HEAD）。Python 包在 python/ 子目录。
-SGLANG_UPSTREAM="/home/ec2-user/efs_data/workspace/sglang-latest"
+# upstream sglang vendored as a submodule (fork happyfanta00/sglang, branch
+# dspark-opd-patches). Python 包在 python/ 子目录。旧的外部 clone
+# /home/ec2-user/efs_data/workspace/sglang-latest 已弃用（submodule 可用后可删）。
+SGLANG_UPSTREAM="${DEEPSPEC_DIR}/third_party/sglang"
 SGLANG_PKG_DIR="${SGLANG_UPSTREAM}/python"
 
 # ---- CUDA / index ----

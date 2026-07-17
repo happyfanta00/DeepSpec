@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "tag": "pb_dspark_c1",
+    "n_requested": 24,
+    "n_ok": 24,
+    "wall_s": 8.75,
+    "throughput_tok_s": 542.87,
+    "throughput_req_s": 2.743,
+    "total_output_tokens": 4750,
+    "latency_s": {
+      "mean": 0.364,
+      "p50": 0.384,
+      "p90": 0.62,
+      "p99": 0.787
+    },
+    "spec": {
+      "is_speculative": true,
+      "mean_accept_length": 4.101,
+      "n_spec_reqs": 24
+    },
+    "config": {
+      "dataset": "eval_datasets/perfectblend.jsonl",
+      "seed": 980406,
+      "concurrency": 1,
+      "max_new_tokens": 256,
+      "temperature": 1.0,
+      "max_prompt_chars": 2000
+    }
+  }
+}

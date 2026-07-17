@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "tag": "pb_baseline_c1",
+    "n_requested": 24,
+    "n_ok": 24,
+    "wall_s": 21.275,
+    "throughput_tok_s": 220.96,
+    "throughput_req_s": 1.128,
+    "total_output_tokens": 4701,
+    "latency_s": {
+      "mean": 0.886,
+      "p50": 1.152,
+      "p90": 1.156,
+      "p99": 1.16
+    },
+    "spec": {
+      "is_speculative": false,
+      "mean_accept_length": null,
+      "n_spec_reqs": 0
+    },
+    "config": {
+      "dataset": "eval_datasets/perfectblend.jsonl",
+      "seed": 980406,
+      "concurrency": 1,
+      "max_new_tokens": 256,
+      "temperature": 1.0,
+      "max_prompt_chars": 2000
+    }
+  }
+}

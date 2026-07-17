@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "tag": "gsm8k_baseline_c1",
+    "n_requested": 24,
+    "n_ok": 24,
+    "wall_s": 25.172,
+    "throughput_tok_s": 221.48,
+    "throughput_req_s": 0.953,
+    "total_output_tokens": 5575,
+    "latency_s": {
+      "mean": 1.049,
+      "p50": 1.154,
+      "p90": 1.156,
+      "p99": 1.157
+    },
+    "spec": {
+      "is_speculative": false,
+      "mean_accept_length": null,
+      "n_spec_reqs": 0
+    },
+    "config": {
+      "dataset": "eval_datasets/gsm8k.jsonl",
+      "seed": 980406,
+      "concurrency": 1,
+      "max_new_tokens": 256,
+      "temperature": 1.0,
+      "max_prompt_chars": 2000
+    }
+  }
+}

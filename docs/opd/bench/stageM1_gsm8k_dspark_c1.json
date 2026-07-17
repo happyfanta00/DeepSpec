@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "tag": "gsm8k_dspark_c1",
+    "n_requested": 24,
+    "n_ok": 24,
+    "wall_s": 8.442,
+    "throughput_tok_s": 661.96,
+    "throughput_req_s": 2.843,
+    "total_output_tokens": 5588,
+    "latency_s": {
+      "mean": 0.352,
+      "p50": 0.356,
+      "p90": 0.434,
+      "p99": 0.501
+    },
+    "spec": {
+      "is_speculative": true,
+      "mean_accept_length": 5.162,
+      "n_spec_reqs": 24
+    },
+    "config": {
+      "dataset": "eval_datasets/gsm8k.jsonl",
+      "seed": 980406,
+      "concurrency": 1,
+      "max_new_tokens": 256,
+      "temperature": 1.0,
+      "max_prompt_chars": 2000
+    }
+  }
+}
