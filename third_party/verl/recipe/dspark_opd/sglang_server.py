@@ -35,8 +35,17 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
-# ---- attention backend: flashinfer (triton crashes on spec-decode long seqs, §4.5) ----
+# ---- attention backends ----
+# target: flashinfer (triton crashes on spec-decode long seqs, §4.5).
 _DEFAULT_ATTN_BACKEND = "flashinfer"
+# draft: fa3 (flashattention v3). flashinfer's per-replay metadata-prep does a D2H sync
+# (plan() .cpu()/.item()); on long-decode shapes it blocks forever waiting on a runaway GPU kernel,
+# stalling one TP scheduler until every rank deadlocks on the TP broadcast -> watchdog SIGQUIT
+# (observed at step 88/110 of a long run). fa3's target_verify graph replay is sync-free at
+# eagle_topk<=1 (needs_cpu_seq_lens=False; flashattention_backend.py:173,2548-2583) — which DSPARK
+# always is (eagle_topk defaults to 1) — so it keeps the spec-decode cuda graph (no eager 3x
+# slowdown) AND removes the hanging sync point. Verified: a long run no longer hangs. See §4.5b.
+_DEFAULT_DRAFT_ATTN_BACKEND = "fa3"
 
 
 def make_sglang_client(host: str, port: int, tp_size: int, model_path: str):
@@ -101,17 +110,33 @@ class DSparkSglangServer:
 
         self._port = int(port)
         self._host = "127.0.0.1"  # server actor & training workers share the node (NodeAffinity)
+        # ★ DIAGNOSTIC (DSPARK_SGLANG_DISABLE_DECODE_GRAPH=1): disable the decode cuda graph so decode
+        # takes the regular init_forward_metadata path instead of init_forward_metadata_out_graph —
+        # a probe for the flashinfer plan() hang that stalls a TP scheduler on long/uncaptured decode
+        # shapes (watchdog SIGQUIT). Costs decode throughput (no graph replay); off by default.
+        _extra = {}
+        if os.environ.get("DSPARK_SGLANG_DISABLE_DECODE_GRAPH", "0") == "1":
+            _extra["cuda_graph_backend_decode"] = "disabled"
+            print("[DSparkSglangServer] decode cuda graph DISABLED (diagnostic)", flush=True)
+        # DRAFT attention backend: fa3 by default (fixes the flashinfer plan() hang, keeps the graph
+        # — see _DEFAULT_DRAFT_ATTN_BACKEND above). Override via DSPARK_SGLANG_DRAFT_ATTN_BACKEND for
+        # A/B (e.g. flashinfer to reproduce the hang, triton to compare). Target stays flashinfer.
+        _draft_attn = os.environ.get("DSPARK_SGLANG_DRAFT_ATTN_BACKEND", "") or _DEFAULT_DRAFT_ATTN_BACKEND
+        if _draft_attn != attention_backend:
+            print(f"[DSparkSglangServer] draft attention backend -> {_draft_attn} "
+                  f"(target stays {attention_backend})", flush=True)
         # ONE server subprocess spanning tp_size GPUs. **kwargs -> ServerArgs unmodified,
         # so speculative_* flow through (unlike verl sync's whitelist which drops them).
         self._engine = HttpServerEngineAdapter(
             model_path=target_path,                              # Qwen3-4B (target)
             speculative_algorithm="DSPARK",
             speculative_draft_model_path=draft_path,             # gamma auto-read from ckpt config
-            speculative_draft_attention_backend=attention_backend,
+            speculative_draft_attention_backend=_draft_attn,
             attention_backend=attention_backend,
             tp_size=int(tp_size),
             mem_fraction_static=float(mem_fraction_static),
             enable_memory_saver=True,                            # release/resume depends on this
+            **_extra,
             # ★ CPU-backup for BOTH target and draft weights. Without these, release_memory_
             # occupation frees the weights' GPU pages and resume remaps FRESH GARBAGE pages
             # (torch_memory_saver only preserves content when enable_cpu_backup=True;
