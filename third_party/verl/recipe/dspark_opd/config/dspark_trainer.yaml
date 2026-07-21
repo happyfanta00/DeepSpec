@@ -10,34 +10,36 @@ defaults:
 
 # ---------------- data ----------------
 data:
-  # our dataset reads the target cache directly; train_files/val_files are unused but
-  # must be valid strings for verl's create_rl_dataset signature.
+  # train_files/val_files are unused (our dataset reads the prompt jsonl) but must be valid strings
+  # for verl's create_rl_dataset signature.
   train_files: /tmp/dspark_opd_dummy.parquet
   val_files: /tmp/dspark_opd_dummy.parquet
   train_batch_size: 2
   max_prompt_length: 4096
   max_response_length: 64
   shuffle: false
-  # Parallel data loading: each sample reads target_hidden_states (~6MB, fp8->bf16 sanitize) from
-  # the cache; with num_workers=0 the main process loads serially and the GPU idles waiting (a
-  # major cause of the low-util / idle windows in multi-step training). 8 workers prefetch in
-  # parallel. Trade-off: a benign "DataLoader worker killed" traceback appears at fit() teardown
-  # (rc still 0, checkpoint intact) — worth it for throughput. persistent_workers avoids per-epoch
-  # respawn cost.
+  # 8 dataloader workers prefetch the (cheap, tokens-only) prompts in parallel. A benign "DataLoader
+  # worker killed" traceback may appear at fit() teardown (rc still 0, checkpoint intact).
   dataloader_num_workers: 8
-  # inject our dataset via verl's create_rl_dataset custom_cls seam
+  # inject our dataset via verl's create_rl_dataset custom_cls seam. DSparkPromptDataset yields raw
+  # prompts (golden chat template); upstream DSPARK sglang generates the response LIVE at train time.
   custom_cls:
     path: recipe/dspark_opd/dataset.py
-    name: DSparkCacheDataset
-  # DSpark dataset params (S1: real target cache)
+    name: DSparkPromptDataset
+  # DSpark dataset params: raw prompt-only corpus (user conversations, NO assistant), golden chat
+  # template (enable_thinking=False) so the rollout prompt matches training/eval exactly.
   dspark:
-    target_cache_path: /mnt/scratch/qwen3_4b_target_cache
-    n_samples: -1      # S6 training cap (cache has ~1.34M); <=0 -> full dataset.
-                          # Must be >= train_batch_size or the dataloader is empty (batch can't
-                          # be formed). gated S0-S5 tests only read the first batch, unaffected.
+    n_samples: -1      # training cap; <=0 -> full dataset. Must be >= train_batch_size.
+    # absolute path — run.sh cd's into third_party/verl, so a relative path resolves wrong.
+    prompt_jsonl_path: /home/ec2-user/efs_data/workspace/DeepSpec/train_datasets/perfectblend_train.jsonl
+    prompt_max_length: 4096
+    enable_thinking: false
 
 # ---------------- algorithm ----------------
 algorithm:
+  # Step-1 loss decoupling: the OPD loss is computed by self-contained differentiable operators
+  # (recipe/dspark_opd/losses.py), NOT by verl's reward→advantage→policy-gradient path. The
+  # adv_estimator below is unused by the DSpark loss (kept only to satisfy verl config schema).
   adv_estimator: token_reward_direct
   use_kl_in_reward: false
 
@@ -51,22 +53,47 @@ actor_rollout_ref:
       dspark_tokenizer_path: Qwen/Qwen3-4B
       # teacher (target) for the FUSED train_step's in-worker scoring (built by _build_teacher)
       dspark_teacher_path: Qwen/Qwen3-4B
-      # opt #4: worker-side cache read — worker re-reads target_hidden_states from this dir by the
-      # dispatched sample_index (must match data.dspark.target_cache_path). See init_model._cache.
-      dspark_target_cache_path: /mnt/scratch/qwen3_4b_target_cache
-      # OPD uses far fewer anchors than SFT (512) because teacher must be co-resident (§2.3)
-      dspark_num_anchors: 32     # A: anchors per sample
+      # A = data-driven #decode-rounds (no hard cap by default, §层面1). Real
+      # responses have vc=90-126 blocks >> 32. Set dspark_max_anchors_cap>0 to hard-cap (drop tail
+      # rounds) after training-corpus round-count stats; 0 = unlimited (size A to batch max).
+      # ★ CAPPED at 64 (2026-07-19): max_new_tokens=2048 / accept_len~6 => a long response can reach
+      # ~340 decode rounds; with cap=0 the full-vocab teacher/draft forwards materialize
+      # [B, A~340, blk=7, V=151936] tensors, and a DP rank that draws a long response peaks ~68G
+      # (others 23-38G — data-dependent imbalance) → OOM at the next step's rollout/T6. Capping A=64
+      # bounds the worst-case tensor to ~1/5. Tail rounds beyond 64 are dropped (loud log in
+      # reconstruct_block_plan). Revisit after corpus round-count stats (§层面1).
+      dspark_max_anchors_cap: 256
+      # TRAIN-rollout max_new_tokens override (sglang path). The eval GOLDEN is 2048; the long
+      # response tail dominates rollout wall time (p50~338 vs max~1560, tail runs alone on the tp
+      # server). Shorten to cut it. 1024 ≈ the cap=256 rounds × accept_len window (so few rounds are
+      # dropped). ⚠️ DEVIATES from eval golden — verify accept length at 2048 before finalizing.
+      # 0 = keep the golden 2048.
+      dspark_rollout_max_new_tokens: 1024
       # top-k dense OPD (tensor-contract K); rollout count n is verl rollout.n (batch dim)
       log_prob_top_k: 16         # K: top-k dense OPD candidates (only_stu); 0 -> single-sample
-      reward_weight_mode: student_p
-      # S4 loss knobs (match SFT config/dspark/dspark_qwen3_4b.py)
-      loss_decay_gamma: 4.0      # block-internal exp(-pos/γ) decay weight
-      confidence_head_alpha: 1.0  # confidence BCE weight in total loss
+      # T5 (sglang path) candidate algo: teacher scores its OWN top-`dspark_teacher_top_k`; draft's
+      # top-`log_prob_top_k` is the loss support; teacher logπ on draft ids uses its value if in
+      # its top-k else min(top-k) (§5.8). Only used on DSPARK_SGLANG_ROLLOUT=1.
+      dspark_teacher_top_k: 64
+      # Step-1 decoupled loss (recipe/dspark_opd/losses.py + loss_config.py). The OPD loss is a
+      # weighted sum of self-contained differentiable operators — NOT reward/advantage/PPO.
+      # NOTE: these MUST be flat scalar keys (not a nested dict). verl's update_model_config
+      # (utils/model.py:66) recurses into any dict-valued override_config key as if it were a
+      # nested HF sub-config -> a nested `dspark_loss:` block crashes with AttributeError on
+      # Qwen3Config. So loss knobs are flat `dspark_loss_*` keys, like every other DSpark key.
+      dspark_loss_reverse_kl_weight: 0.0   # top-K reverse-KL, pathwise/analytic grad (D1 topk_pathwise)
+      dspark_loss_forward_kl_weight: 1.0
+      dspark_loss_confidence_weight: 1.0   # acceptance-rate BCE weight (was confidence_head_alpha)
+      dspark_loss_reject_kl_weight: 1.0
+      dspark_loss_reverse_kl_mode: topk_pathwise  # only topk_pathwise implemented (k3/reinforce deferred, D2)
+      dspark_loss_decay_gamma: 4.0         # block-internal exp(-pos/γ) decay (SFT-consistent; applied ONCE)
+      dspark_loss_agg_mode: token-mean
+      dspark_loss_max_clamp: null          # optional symmetric per-token loss clamp (null = off)
   actor:
     strategy: fsdp
     use_kl_loss: false
-    ppo_mini_batch_size: 8          # prompt units; verl normalizes ×rollout.n÷dp -> per-GPU mini
-    ppo_micro_batch_size_per_gpu: 1  # per-GPU micro; update_dspark_opd splits+accumulates (§S4)
+    ppo_mini_batch_size: 16          # prompt units; verl normalizes ×rollout.n÷dp -> per-GPU mini
+    ppo_micro_batch_size_per_gpu: 4  # per-GPU micro; update_dspark_opd splits+accumulates (§S4)
     fsdp_config:
       # actor uses ShardingStrategy.NO_SHARD (set in worker._build_model_optimizer): per-card
       # full params + cross-rank grad all-reduce. fsdp_size=-1 -> self.device_mesh is 1D (size
@@ -102,7 +129,7 @@ trainer:
   # total_training_steps to an int to cap at a fixed step count instead (may stop mid-epoch).
   total_epochs: 1
   total_training_steps: null
-  save_freq: 100               # checkpoint every N steps (-1=never; final step always saved)
+  save_freq: 2000               # checkpoint every N steps (-1=never; final step always saved)
   val_before_train: false
   logger: [console]
   project_name: dspark_opd

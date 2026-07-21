@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# DSpark-on-SGLang 环境安装脚本 (Stage-M0，UPSTREAM sglang)
+# DSpark-on-SGLang 环境安装脚本 (Stage-M0，UPSTREAM sglang + verl 统一 env)
 #
-# 用途：把「最新 upstream sglang（HEAD）」装进独立 env，用其【原生 DSPARK】路径做
-#   完整-draft-分布 rejection sampling 的无损验证。
-#   背景 & 决策：docs/opd/dspark-on-sglang-design.md §3（环境）、§4（正确性调查）。
+# 用途：把「最新 upstream sglang（HEAD）」+「verl 训练栈」装进【同一个 env】，使
+#   ① Stage-M1：用其【原生 DSPARK】路径做完整-draft-分布 rejection sampling 无损验证；
+#   ② Stage-M2 T3 起：verl HYBRID rollout 在【本 env 内】起 sglang engine 现场投机解码
+#      —— verl 的 HYBRID replica 把 sglang 作为同 env 的 Ray actor+子进程拉起（与训练 FSDP
+#      共卡），故 sglang 与 verl【必须同 env 可 import】，不能再是两个隔离 env。
+#   背景 & 决策：docs/opd/dspark-on-sglang-design.md §3（环境）、§4（正确性）、§5.6（T3）。
 #
 # ⚠️ 本脚本【由用户手动执行】，Claude 不直接操作 python 环境。
 #     建议逐 STEP 跑，观察每步输出；任一 STEP 报错就停下把 traceback 贴回。
@@ -19,7 +22,7 @@
 #   - 策略（用户已定）：先试【方案2 全量官方依赖】(STEP 3B)；若卡住 → 降级【方案1 最小
 #     子集】(STEP 3A + 按 import 报错逐步补)。二者都是 --no-deps editable 装 sglang 本体。
 #
-# 主 env ~/.venv/dspark-opd 永久不动（回退基线）；本 env 独立长存。
+# 主 env ~/.venv/dspark-opd 永久不动（纯训练回退基线）；本 env = 统一 env（sglang + verl）。
 # =============================================================================
 set -uo pipefail   # 注意：不 set -e，便于逐步观察；关键步失败会显式提示
 
@@ -121,6 +124,32 @@ uv pip install --python "$PY" \
     || echo ">>> 最小子集里有包装失败，贴报错逐个处理。"
 
 # -----------------------------------------------------------------------------
+echo; echo "### STEP 3C  —  verl 运行时核心依赖（统一 env：本 env 同时跑 sglang engine + verl 训练）"
+echo "    (Stage-M2 T3 起 verl HYBRID rollout 在【本 env 内】起 sglang，故 verl 必须与 sglang"
+echo "     同 env 可 import。只装 verl core install_requires 里本 env 尚缺的纯依赖；不碰 torch/tf。)"
+# verl core deps 已在本 env 的：datasets/dill/pyarrow/pandas/packaging/transformers（5.12.1）。
+# 缺的（逐一装）：ray/tensordict/torchdata/codetiming/hydra-core(+omegaconf)/accelerate/peft/
+#   pybind11/pylatexenc/wandb/tensorboard。deepspec 不需 pip 装（run.sh 用 PYTHONPATH，纯 python）。
+# ⚠️ numpy（用户已定：保留 2.x）：verl 声明 numpy<2.0.0，但 sglang HEAD 需 numpy>=2（本 env 已
+#   2.3.5）。下面这批 deps 均不 pin numpy<2，且 STEP 4B 装 verl 用 --no-deps → numpy 不动。若 verl
+#   运行期真撞 numpy 2.x 不兼容点，再逐个 patch（verl 0.7 多数功能在 numpy 2.x 下可跑）。
+# ⚠️ tensordict：verl pin <=0.10.0；但 tensordict 有按 torch 版本编译的组件，若 0.10.0 与 torch
+#   2.11 ABI 不匹配 import 失败，则放宽装最新（verl 0.7 通常兼容更高 tensordict）——报错贴回。
+uv pip install --python "$PY" \
+    "ray[default]>=2.41.0" \
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0" \
+    torchdata \
+    codetiming \
+    "hydra-core" omegaconf \
+    accelerate peft \
+    pybind11 pylatexenc \
+    wandb tensorboard \
+    || echo ">>> verl 运行时依赖里有包装失败，贴报错逐个处理（尤其 tensordict/torch ABI）。"
+# 校验：确认关键数值后端未被这批 deps 顺带改动（torch 2.11 / tf 5.12 / numpy 2.x 应原样）
+"$PY" -c "import torch, transformers, numpy; print(f'  after verl-deps: torch={torch.__version__} tf={transformers.__version__} numpy={numpy.__version__}')" \
+    || echo ">>> 校验失败：torch/transformers/numpy 被改动，检查上面的解析。"
+
+# -----------------------------------------------------------------------------
 echo; echo "### STEP 4  —  editable 安装 upstream sglang 本体 (--no-deps, 跳过 rust 扩展)"
 echo "    (--no-deps：不让它再解析 pyproject 全量依赖，依赖已由 STEP 1-3 手工控制)"
 # [已核实] pyproject 声明了一个 setuptools-rust 扩展 sglang.srt.grpc._core（gRPC server 用），
@@ -135,26 +164,66 @@ uv pip install --python "$PY" --no-deps -e "$SGLANG_PKG_DIR" \
          echo "    其它报错贴回 Claude。"; }
 
 # -----------------------------------------------------------------------------
-echo; echo "### STEP 5  —  冒烟：import sglang + 原生 DSPARK 模块可加载"
-"$PY" - <<'PYEOF'
+echo; echo "### STEP 4B  —  editable 安装 verl 本体 (--no-deps, 统一 env)"
+echo "    (--no-deps：依赖已由 STEP 3C 手工装齐，绝不让 verl 解析 install_requires 顺带改"
+echo "     torch/transformers/numpy。verl 是纯 python，torch 2.11 下 editable 装无需重编。)"
+uv pip install --python "$PY" --no-deps -e "$VERL_DIR" \
+    || echo ">>> verl editable 装失败，贴报错。"
+# deepspec 不 pip 装：run.sh 用 PYTHONPATH=$DEEPSPEC_DIR:$VERL_DIR 提供（纯 python）。
+
+# -----------------------------------------------------------------------------
+echo; echo "### STEP 5  —  冒烟：统一 env 同时可 import sglang(原生 DSPARK) + verl 训练栈 + deepspec"
+echo "    (Stage-M2 T3 起 verl HYBRID rollout 在本 env 内起 sglang，故二者必须同 env 共存。)"
+# deepspec 靠 PYTHONPATH，故 smoke 也带上（与 run.sh 一致）；verl recipe __init__ 触发 rollout 注册。
+PYTHONPATH="$DEEPSPEC_DIR:$VERL_DIR:${PYTHONPATH:-}" "$PY" - <<'PYEOF'
 import sys, traceback
-mods = [
+# ⚠️ 顺序关键：先 import recipe.dspark_opd —— 它的 __init__ 装两个 compat shim
+#   （transformers AutoModelForVision2Seq 别名 + sglang HEAD _launch_subprocesses 3-tuple 适配），
+#   必须在任何 verl.workers.rollout / sglang_rollout import 之前跑（训练侧 task_runner 亦如此保证）。
+ok = True
+try:
+    import recipe.dspark_opd  # noqa: F401  (compat shims + rollout registration)
+    print(f"  [OK] import recipe.dspark_opd (shims: tf={recipe.dspark_opd._COMPAT_PATCHED} "
+          f"sglang_launch={recipe.dspark_opd._SGLANG_LAUNCH_SHIMMED})")
+except Exception as e:
+    ok = False
+    print(f"  [FAIL] import recipe.dspark_opd: {e!r}")
+    traceback.print_exc(limit=3)
+
+# (1) upstream 原生 DSPARK 链路（Stage-M0 原有断言）
+sglang_mods = [
     "sglang",
     "sglang.srt.speculative.reject_sampling",
     "sglang.srt.speculative.dspark_components.dspark_verify",
     "sglang.srt.speculative.dspark_components.kernels.dspark_accept",
     "sglang.srt.models.dspark",
 ]
-ok = True
-for m in mods:
+# (2) verl 训练栈 + deepspec draft modeling（统一 env 新增断言）
+verl_mods = [
+    "ray",
+    "verl",                                  # protocol.py → ray/tensordict/torch import 链
+    "verl.workers.rollout.replica",          # T3 HYBRID 用 get_rollout_replica_class
+    "verl.workers.rollout.sglang_rollout.async_sglang_server",  # SGLangReplica/SGLangHttpServer（触发 _launch_subprocesses import）
+    "deepspec.modeling.dspark.qwen3",        # 训练侧 draft 模型（PYTHONPATH 提供）
+]
+for m in sglang_mods + verl_mods:
     try:
         __import__(m)
         print(f"  [OK] import {m}")
     except Exception as e:
         ok = False
         print(f"  [FAIL] import {m}: {e!r}")
-        traceback.print_exc(limit=2)
-print("[Stage-M0] UPSTREAM DSPARK IMPORT", "OK" if ok else "FAILED")
+        traceback.print_exc(limit=3)
+# (3) verl 能取到 sglang HYBRID replica 类（T3 前置）
+try:
+    from verl.workers.rollout.replica import get_rollout_replica_class
+    cls = get_rollout_replica_class("sglang")
+    print(f"  [OK] get_rollout_replica_class('sglang') -> {cls.__name__}")
+except Exception as e:
+    ok = False
+    print(f"  [FAIL] get_rollout_replica_class('sglang'): {e!r}")
+    traceback.print_exc(limit=3)
+print("[Stage-M0] UNIFIED ENV IMPORT", "OK" if ok else "FAILED")
 sys.exit(0 if ok else 1)
 PYEOF
 RC=$?
@@ -167,10 +236,13 @@ echo "    冻结到 docs/opd/pip-freeze-sglang-upstream.txt"
 echo
 echo "=========================================================="
 if [ "$RC" -eq 0 ]; then
-  echo " Stage-M0 完成：STEP 5 打印 IMPORT OK。"
-  echo " 下一步 Stage-M1：起 DSPARK server 做无损 A/B 对拍（见 findings §6）。"
+  echo " Stage-M0 完成：STEP 5 打印 UNIFIED ENV IMPORT OK"
+  echo "   → 本 env 同时支持 sglang 原生 DSPARK + verl 训练栈 + deepspec draft modeling。"
+  echo " 下一步 Stage-M2 T3：verl HYBRID rollout 在本 env 内起 sglang（见 design.md §5.6）。"
 else
-  echo " Stage-M0 未完成：STEP 5 有 FAIL。把 traceback 贴回 Claude，"
-  echo " 按缺失模块补依赖（多数是 STEP 3A 里漏的某个包，或 sgl-kernel/flashinfer 版本）。"
+  echo " Stage-M0 未完成：STEP 5 有 FAIL。把 traceback 贴回 Claude："
+  echo "   - sglang_mods FAIL → 缺 STEP 3A 某包 / sgl-kernel / flashinfer 版本。"
+  echo "   - verl_mods FAIL  → 缺 STEP 3C 某 verl core dep（ray/tensordict/hydra…）"
+  echo "     或 tensordict 与 torch 2.11 ABI 不匹配（放宽 tensordict 上限重试）。"
 fi
 echo "=========================================================="

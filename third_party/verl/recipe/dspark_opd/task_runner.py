@@ -57,6 +57,7 @@ class DSparkTaskRunner(MainTaskRunner):
         collate_fn = dspark_collate_fn
 
         print(f"[DSparkTaskRunner] host={socket.gethostname()}")
+
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 

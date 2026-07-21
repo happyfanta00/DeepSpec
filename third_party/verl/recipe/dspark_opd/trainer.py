@@ -58,6 +58,13 @@ class DSparkTrainer(RayPPOTrainer):
         self.global_steps = 0
         print(f"[DSparkTrainer] fit: total_epochs={total_epochs} steps_per_epoch={steps_per_epoch} "
               f"-> total_training_steps={total_steps} rollout.n={rollout_n} save_freq={save_freq}")
+
+        # Stage-M2 T3b: if the sglang-rollout path is enabled, build the tp=8 DSPARK server actor
+        # (colocated on the training GPUs) and push its address to every worker. Off by default
+        # (DSPARK_SGLANG_ROLLOUT unset) -> the cache-response fused path runs unchanged. Registers
+        # an atexit shutdown for crash safety; also shut down explicitly at fit() end below.
+        self._maybe_start_sglang_server()
+
         # Rolling step-time average for throughput / ETA. Skip step 1 (it eats compile + FSDP
         # lazy-init warmup and would bias the estimate) — accumulate from step 2 onward.
         _timed_sum, _timed_n = 0.0, 0
@@ -75,8 +82,9 @@ class DSparkTrainer(RayPPOTrainer):
                 _step_s = time.perf_counter() - _t0
                 lg = loss_out.batch
                 metrics = {k: float(lg[k].reshape(-1)[0]) for k in (
-                    "actor/loss", "actor/pg_loss", "actor/confidence_loss",
-                    "actor/grad_norm", "actor/ppo_kl", "actor/n_micro") if k in lg}
+                    "actor/loss", "actor/reverse_kl_loss", "actor/forward_kl_loss",
+                    "actor/reject_kl_loss", "actor/confidence_loss", "actor/grad_norm",
+                    "actor/n_micro", "actor/draft_weights_pushed") if k in lg}
                 _mode = "driver-repeat" if _REPEAT_ON_DRIVER else "worker-repeat"
                 # throughput + ETA (avg over timed steps; falls back to this step's time on step 1)
                 if self.global_steps > 1:
@@ -96,8 +104,65 @@ class DSparkTrainer(RayPPOTrainer):
                     break
         if save_freq > 0 and self.global_steps % save_freq != 0:
             self._save_checkpoint()   # final save
+        self._shutdown_sglang_server()
         print(f"[DSparkTrainer] fit done at step {self.global_steps} "
               f"(avg {_avg:.2f}s/step, ~{_fmt_eta(_avg * self.global_steps)} total).")
+
+    def _maybe_start_sglang_server(self):
+        """T3b: build the tp=8 DSPARK sglang server actor + push its address to all workers.
+
+        No-op unless DSPARK_SGLANG_ROLLOUT=1. Colocates the server on the training workers' GPUs
+        (build_dspark_sglang_server: NOSET + joined CUDA_VISIBLE_DEVICES + NodeAffinity), then
+        broadcasts (host, port) to every worker's set_sglang_server (ONE_TO_ALL) so they build
+        launch_server=False HTTP clients. mem_fraction defaults small (0.15) for the resident
+        design (§5.6b); the engine stays resident, no per-step release/resume.
+        """
+        self._sglang_server = None
+        if os.environ.get("DSPARK_SGLANG_ROLLOUT", "0") != "1":
+            return
+        from recipe.dspark_opd.sglang_server import build_dspark_sglang_server
+
+        arc = self.config.actor_rollout_ref
+        oc = dict(arc.model.get("override_config", {}) or {})
+        target_path = oc.get("dspark_teacher_path") or oc.get("dspark_tokenizer_path")
+        draft_path = arc.model.path
+        tp = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.get("nnodes", 1))
+        # §5.6c KV-offload: a LARGE KV pool (fast rollout) that is released to training each step.
+        # Default larger (0.6) when offload is on, else the resident small-pool default (0.15).
+        _kv_offload = os.environ.get("DSPARK_SGLANG_KV_OFFLOAD", "0") == "1"
+        _default_mf = "0.6" if _kv_offload else "0.15"
+        mem_fraction = float(os.environ.get("DSPARK_SGLANG_MEM_FRACTION", _default_mf))
+        print(f"[DSparkTrainer] T3b: starting DSPARK sglang server (tp={tp}, "
+              f"mem_fraction={mem_fraction}, kv_offload={_kv_offload}, "
+              f"target={target_path}, draft={draft_path}) ...")
+        self._sglang_server, (host, port) = build_dspark_sglang_server(
+            worker_group=self.actor_rollout_wg,
+            target_path=target_path, draft_path=draft_path,
+            tp_size=tp, mem_fraction_static=mem_fraction,
+        )
+        # crash-safety: kill the server subprocess if the driver dies unexpectedly.
+        import atexit
+        atexit.register(self._shutdown_sglang_server)
+        # push address + TP to all workers -> they build launch_server=False HTTP clients.
+        # tp_size matters for T6: the client serializes one weight copy per TP rank (§set_sglang_server).
+        self.actor_rollout_wg.set_sglang_server(host, int(port), tp)
+        print(f"[DSparkTrainer] T3b: sglang server ready at http://{host}:{port} (tp={tp}); workers wired.")
+
+    def _shutdown_sglang_server(self):
+        """Shut down the T3b sglang server actor (idempotent; safe to call from atexit + fit end)."""
+        srv = getattr(self, "_sglang_server", None)
+        if srv is None:
+            return
+        self._sglang_server = None
+        import ray
+        try:
+            ray.get(srv.shutdown.remote())
+        except Exception as e:  # noqa: BLE001 — best-effort
+            print(f"[DSparkTrainer] sglang server shutdown error (ignored): {e!r}")
+        try:
+            ray.kill(srv)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _prepare_batch(self, batch_dict, repeat_n=1):
         """dict -> DataProto (+ uid). NO rollout.n repeat here — deferred to the worker.

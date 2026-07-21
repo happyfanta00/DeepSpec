@@ -13,6 +13,25 @@
 #     bash recipe/dspark_opd/run.sh
 # Fixed step count (e.g. a short smoke run):
 #   NGPUS=2 BATCH=16 STEPS=3 EXP=smoke bash recipe/dspark_opd/run.sh
+#
+# Stage-M2 T3b — sglang DSPARK rollout (response generated live by the tp=8 sglang server
+# instead of read from cache): use the UNIFIED env + set DSPARK_SGLANG_ROLLOUT=1. The trainer
+# then builds the resident tp=8 DSPARK server (mem_fraction via DSPARK_SGLANG_MEM_FRACTION,
+# default 0.15) colocated on the training GPUs and wires all workers as clients. Example:
+#   NGPUS=8 BATCH=8 STEPS=3 EXP=t3b CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#     VENV_PY=$HOME/.venv/dspark-opd-sglang/bin/python DSPARK_SGLANG_ROLLOUT=1 \
+#     bash recipe/dspark_opd/run.sh
+# Default (flag unset) runs the original cache-response fused path in the main env, unchanged.
+#
+# §5.6c KV-offload — LARGE KV pool for fast rollout, released to training each step (only the KV
+# cache; weights stay resident). Add DSPARK_SGLANG_KV_OFFLOAD=1; mem_fraction defaults to 0.6 when
+# offload is on (0.15 otherwise), override via DSPARK_SGLANG_MEM_FRACTION. NOTE: the rollout-state
+# PEAK is (sglang KV pool + resident training model) co-resident — pick mem_fraction so that peak
+# stays <= 80GB (0.55 => ~48G sglang + ~32G train). KV release frees ~45G/GPU back for training.
+#   NGPUS=8 BATCH=8 STEPS=3 EXP=kvoffload CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#     VENV_PY=$HOME/.venv/dspark-opd-sglang/bin/python \
+#     DSPARK_SGLANG_ROLLOUT=1 DSPARK_SGLANG_KV_OFFLOAD=1 DSPARK_SGLANG_MEM_FRACTION=0.55 \
+#     bash recipe/dspark_opd/run.sh
 set -x
 
 VENV_PY=${VENV_PY:-$HOME/.venv/dspark-opd/bin/python}
